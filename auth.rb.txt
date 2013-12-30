@@ -91,7 +91,7 @@ class HTTPClient
       @authenticator = [@oauth, @sspi_negotiate_auth, @negotiate_auth, @ntlm_auth, @digest_auth, @basic_auth]
       # @authenticator = [@oauth, @negotiate_auth, @ntlm_auth, @sspi_negotiate_auth, @digest_auth, @basic_auth]
     end
-
+# 
     # Resets challenge state.  See sub filters for more details.
     def reset_challenge
       @authenticator.each do |auth|
@@ -110,19 +110,12 @@ class HTTPClient
     # Filter API implementation.  Traps HTTP request and insert
     # 'Authorization' header if needed.
     def filter_request(req)
-      puts ">>>>>>>>>>>> @req = #{req.body}"
       @authenticator.each do |auth|
-        puts "class = #{auth.class}"
         next unless auth.set? # hasn't be set, don't use it
-        puts "A0--------------------- #{auth.class}"
         if cred = auth.get(req)
-          #puts "A1--------------------- #{auth.class}"
-          #puts "Request Before: #{req.dump}"
           auth.encrypt_payload(req) if auth.respond_to?(:encrypt_payload)
           # Lets try to override content -length
           req.header.set('Content-Length', req.body.length)
-          puts "Request After: #{req.dump}"
-          puts "Body encrypted.... #{req.body}"
           req.header.set('Authorization', auth.scheme + " " + cred)
           return
         end
@@ -149,6 +142,18 @@ class HTTPClient
         end
       end
       command
+    end
+
+    def decrypt_response(content)
+      @authenticator.each do |auth|
+        next unless auth.set? # hasn't be set, don't use it
+        # puts "Calling decrypt for :>> \n #{content}"
+        # puts "-----------------------------------------------"
+        # puts "auth.respond_to?(:encrypted_channel) = #{auth.respond_to?(:encrypted_channel?)}"
+        # puts "auth.encrypted_channel? = #{auth.encrypted_channel?}" if auth.respond_to?(:encrypted_channel?)
+        return auth.decrypt_payload(content) if auth.respond_to?(:encrypted_channel?) and auth.encrypted_channel?
+      end
+      content
     end
   end
 
@@ -553,6 +558,7 @@ class HTTPClient
       domain_uri, param = @challenge.find { |uri, v|
         Util.uri_part_of(target_uri, uri)
       }
+
       return nil unless param
       state = param[:state]
       authenticator = param[:authenticator]
@@ -560,7 +566,6 @@ class HTTPClient
       case state
       when :init
         if SSPIEnabled
-          puts "here1....--#{@scheme}--"
           authenticator = param[:authenticator] = Win32::SSPI::NegotiateAuth.new
           @authenticator = authenticator #  Hacky remember
           return authenticator.get_initial_token(@scheme)
@@ -572,8 +577,7 @@ class HTTPClient
       when :response
         @challenge.delete(domain_uri)
         if SSPIEnabled
-          puts "authphrase = #{authphrase}"
-          return authenticator.complete_authentication(authphrase)
+          return @auth_token = authenticator.complete_authentication(authphrase)
         else # use GSSAPI
           return authenticator.init_context(authphrase.unpack('m').pop)
         end
@@ -581,14 +585,19 @@ class HTTPClient
       nil
     end
 
+    def encrypted_channel?
+      @encrypted_channel
+    end
+
     def encrypt_payload(req)
-      puts "req.http_body.class = #{req.http_body.class}"
-      puts "req.class = #{req.class}"
+      # puts "req.http_body.class = #{req.http_body.class}"
+      # puts "req.class = #{req.class}"
       # puts req.http_body = Body.new(@authenticator.encrypt_payload(req.body) if SSPIEnabled
         if SSPIEnabled
           # @authenticator.encrypt_payload(req.body)
           body = @authenticator.encrypt_payload(req.body)
-          puts "############################"
+          @encrypted_channel = true
+          # puts "############################"
           req.http_body = HTTP::Message::Body.new
           req.http_body.init_request(body)
           # if body is encrypted update the header
@@ -598,10 +607,20 @@ class HTTPClient
         end
     end
 
+    def decrypt_payload(body)
+      if SSPIEnabled
+        body = @authenticator.decrypt_payload(body)
+        # puts "Content Decrypted: #{body}"
+      end
+      body
+    end
+
     # Challenge handler: remember URL and challenge token for response.
     def challenge(uri, param_str)
       return false unless SSPIEnabled || GSSAPIEnabled
+      # puts "challenge = #{@challenge} and param_str = #{param_str} for uri = #{uri}"
       if param_str.nil? or @challenge[uri].nil?
+        # puts caller
         c = @challenge[uri] = {}
         c[:state] = :init
         c[:authenticator] = nil

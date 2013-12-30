@@ -44,6 +44,7 @@ module Win32
 			InitializeSecurityContext = Win32API.new("secur32", "InitializeSecurityContext", 'pppLLLpLpppp', 'L')
 			QueryContextAttributes = Win32API.new("secur32", "QueryContextAttributes", 'pLp', 'L')
 			EncryptMessage = Win32API.new("secur32", "EncryptMessage", 'pLpL', 'L')
+			DecryptMessage = Win32API.new("secur32", "DecryptMessage", 'ppLp', 'L')
 
 			# Can be called with DeleteSecurityContext.call()
 			DeleteSecurityContext = Win32API.new("secur32", "DeleteSecurityContext", 'P', 'L')
@@ -179,7 +180,6 @@ module Win32
 			def initialize(data_buffer, sizes)
 				@original_msg_len = data_buffer.length
 				@cbSecurityTrailer = sizes.cbSecurityTrailer
-				puts ">> #{@cbSecurityTrailer} <<"
 				@data_buffer = data_buffer
 				@security_trailer = "\0" * sizes.cbSecurityTrailer
 			end
@@ -191,12 +191,9 @@ module Win32
 				# Assignment of inner structure to variable is very important here. Without it,
 				# will not be able to unpack changes to the structure. Alternative, nested unpacks,
 				# does not work (i.e. @struct.unpack("LLP12")[2].unpack("LLP12") results in "no associated pointer")
-				@sec_buffer_data ||= [@original_msg_len, SECBUFFER_DATA, @data_buffer].pack("LLP")
-				@sec_buffer_token ||= [@cbSecurityTrailer, SECBUFFER_TOKEN, @security_trailer].pack("LLP")
 				@sec_buffer = [@original_msg_len, SECBUFFER_DATA, @data_buffer, @cbSecurityTrailer, SECBUFFER_TOKEN, @security_trailer].pack("LLPLLP")
 				@struct ||= [SECBUFFER_VERSION, 2, @sec_buffer].pack("LLP")
 			end
-			# Approach-1  ends
 
 			def buffer
 				unpack
@@ -212,16 +209,60 @@ module Win32
 				if ! @unpacked && @sec_buffer && @struct
 					dataBufferSize, dType, dataBuffer, tokenBufferSize, tType, tokenBuffer = @sec_buffer.unpack("LLPLLP")
 					dataBufferSize, dType, dataBuffer, tokenBufferSize, tType, tokenBuffer = @sec_buffer.unpack("LLP#{dataBufferSize}LLP#{tokenBufferSize}")
-					puts ">> data = #{dataBufferSize} << "
-					puts ">> token = #{tokenBufferSize} <<"
-					# @buffer = dataBuffer + tokenBuffer
-					# @buffer = [tokenBufferSize].pack("L") + tokenBuffer + [dataBufferSize].pack("L") + dataBuffer
 					@buffer = [tokenBufferSize].pack("L")
 					@buffer << tokenBuffer << dataBuffer
-					puts "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#{@buffer.class} => #{@buffer.length} => #{tokenBufferSize} + #{dataBufferSize}"
-					# puts "#{[tokenBufferSize].pack("L")} <<---------->> #{tokenBuffer} <<--------------->> #{[dataBufferSize].pack("L")} <<-------------->> #{dataBuffer}"
+					@struct = nil
+					@sec_buffer = nil
+					@unpacked = true
+				end
+			end
 
-					puts "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+		end
+
+		class DecryptSecurityBuffer
+
+			SECBUFFER_DATA = 0x1    # Security buffer data
+			SECBUFFER_TOKEN = 0x2   # Security token
+			SECBUFFER_PADDING = 0x9 # Security buffer padding
+			SECBUFFER_STREAM_HEADER = 0x7
+			SECBUFFER_STREAM_TRAILER = 0x6
+			SECBUFFER_EMPTY = 0x0
+
+			SECBUFFER_VERSION = 0
+
+			def initialize(buffer)
+				# # unpack to extract the msg and token
+				token_size, token_buffer, enc_buffer = buffer.unpack("L")
+				@original_msg_len = buffer.length - token_size - 4
+				@cbSecurityTrailer, @security_trailer, @data_buffer = buffer.unpack("La#{token_size}a#{@original_msg_len}")
+			end
+
+			def to_p
+				# Assumption is that when to_p is called we are going to get a packed structure. Therefore,
+				# set @unpacked back to nil so we know to unpack when accessors are next accessed.
+				@unpacked = nil
+				# Assignment of inner structure to variable is very important here. Without it,
+				# will not be able to unpack changes to the structure. Alternative, nested unpacks,
+				# does not work (i.e. @struct.unpack("LLP12")[2].unpack("LLP12") results in "no associated pointer")
+				@sec_buffer = [@original_msg_len, SECBUFFER_DATA, @data_buffer, @cbSecurityTrailer, SECBUFFER_TOKEN, @security_trailer].pack("LLPLLP")
+				@struct ||= [SECBUFFER_VERSION, 2, @sec_buffer].pack("LLP")
+			end
+
+			def buffer
+				unpack
+				@buffer
+			end
+
+		private
+
+			# Unpacks the SecurityBufferDesc structure into member variables. We
+			# only want to do this once per struct, so the struct is deleted
+			# after unpacking.
+			def unpack
+				if ! @unpacked && @sec_buffer && @struct
+					dataBufferSize, dType, dataBuffer, tokenBufferSize, tType, tokenBuffer = @sec_buffer.unpack("LLPLLP")
+					dataBufferSize, dType, dataBuffer, tokenBufferSize, tType, tokenBuffer = @sec_buffer.unpack("LLP#{dataBufferSize}LLP#{tokenBufferSize}")
+					@buffer = dataBuffer
 					@struct = nil
 					@sec_buffer = nil
 					@unpacked = true
@@ -349,9 +390,9 @@ module Win32
 			# be easily decoded, however.
 			def get_initial_token(auth_type)
 				raise "This object is no longer usable because its resources have been freed." if @cleaned_up
-			puts "here0..."
+
 				get_credentials auth_type
-puts "here..."
+
 				outputBuffer = SecurityBuffer.new
 				@context = CtxtHandle.new
 				@contextAttributes = "\0" * 4
@@ -383,7 +424,7 @@ puts "here..."
 
 				if token.include? B64_TOKEN_PREFIX
 					# indicates base64 encoded token
-          token = token.strip.unpack("m")[0]
+          			token = token.strip.unpack("m")[0]
 				end
 
 				outputBuffer = SecurityBuffer.new
@@ -393,7 +434,6 @@ puts "here..."
 					outputBuffer.to_p, @contextAttributes, TimeStamp.new.to_p))
 
 				if result.ok? then
-					puts "Auth completed"
 					@auth_completed = true
 					return encode_token(outputBuffer.token)
 				else
@@ -405,28 +445,15 @@ puts "here..."
 			end
 
 			def encrypt_payload(body)
-				puts "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 				if @auth_completed
-					puts "#{self.class} = body.length = #{body.length} = body = #{body}"
-					puts "Query the required buffer length: "
-
 					# Approach-1 http://msdn.microsoft.com/en-us/magazine/cc301890.aspx
 					sizes = SecPkgContext_Sizes.new
 					result = SSPIResult.new(API::QueryContextAttributes.call(@context.to_p, SECPKG_ATTR_SIZES, sizes.to_p))
 
-					# Approach-2 http://msdn.microsoft.com/en-us/library/windows/desktop/aa375375%28v=vs.85%29.aspx
-					# sizes = SecPkgContext_StreamSizes.new
-					# result = SSPIResult.new(API::QueryContextAttributes.call(@context.to_p, SECPKG_ATTR_STREAM_SIZES, sizes.to_p))
-					puts "result = #{result}"
-					puts " sizes = #{sizes}"
-					
 					outputBuffer = EncryptSecurityBuffer.new(body, sizes)
 					result = SSPIResult.new(API::EncryptMessage.call(@context.to_p, 0, outputBuffer.to_p, 0 ))
-					puts "EncryptMessage result = #{result}"
-					puts "outputBuffer.buffer.length = #{outputBuffer.buffer.length}"
 					encrypted_msg = outputBuffer.buffer
-					puts "encrypted_msg.length = #{encrypted_msg.length}"
-					puts "sizes.cbSecurityTrailer = #{sizes.cbSecurityTrailer}"
+
 					body = <<-EOF
 --Encrypted Boundary\r
 Content-Type: application/HTTP-SPNEGO-session-encrypted\r
@@ -436,8 +463,19 @@ Content-Type: application/octet-stream\r
 #{encrypted_msg}--Encrypted Boundary\r
 EOF
 	      end
-	      		# puts "Done encrypt_payload........#{body.unpack('H*')}....."
-	      		puts "--------Length of body = #{body.length}"
+				body
+			end
+
+			def decrypt_payload(body)
+				if @auth_completed
+
+					matched_data = /--Encrypted Boundary\s+Content-Type:\s+application\/HTTP-SPNEGO-session-encrypted\s+OriginalContent:\s+type=\S+Length=(\d+)\s+--Encrypted Boundary\s+Content-Type:\s+application\/octet-stream\s+([\S\s]+)--Encrypted Boundary/.match(body)
+					encrypted_msg = matched_data[2]
+
+					outputBuffer = DecryptSecurityBuffer.new(encrypted_msg)
+					result = SSPIResult.new(API::DecryptMessage.call(@context.to_p, outputBuffer.to_p, 0, 0 ))
+					body = outputBuffer.buffer
+				end
 				body
 			end
 
